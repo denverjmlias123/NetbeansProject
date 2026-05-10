@@ -1,0 +1,180 @@
+-- =============================================
+--  DATABASE : projectexe
+--  STOCKPOS  Inventory & Point of Sale System
+--  VERSION  : FINAL  (all sessions consolidated)
+-- =============================================
+--
+--  KEY DESIGN RULES (read before editing):
+--
+--  1. products has NO 'status' column.
+--     Status ("Full Stock" / "Low Stock" / "Out of Stock")
+--     is computed in Java via calculateStatus(stock, low_stock_alert).
+--     StockAction, DashboardInventory, and DashboardPOS all do this.
+--
+--  2. activity_log.action_type must be one of:
+--       'Product Added'  → displayed as "Added"
+--       'Stock In'       → displayed as "Stock In"
+--       'Stock Out'      → displayed as "Stock Out"  (also used by POS sales)
+--       'Edit'           → displayed as "Edited"
+--       'Delete'         → displayed as "Deleted"
+--     The switch in DashboardInventory.loadRecentActivity() depends on
+--     these exact strings.
+--
+--  3. transactions.payment_method must be one of:
+--       'Cash' | 'GCash' | 'Credit Card'
+--
+--  4. time_log.module must always be supplied:
+--       'Inventory' (DashboardInventory logout)
+--       'POS'       (DashboardPOS logout)
+--
+-- =============================================
+
+CREATE DATABASE IF NOT EXISTS projectexe
+  CHARACTER SET utf8mb4
+  COLLATE utf8mb4_unicode_ci;
+USE projectexe;
+
+-- =============================================
+--  TABLE: users
+--  Stores admin + cashier accounts.
+--  Cashiers link to their admin via parent_id.
+-- =============================================
+CREATE TABLE IF NOT EXISTS users (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    full_name   VARCHAR(100)            NOT NULL,           -- required; DashboardInventory.btnSaveUser fills this
+    username    VARCHAR(50)             NOT NULL UNIQUE,
+    password    VARCHAR(64)             NOT NULL,           -- SHA-256 hex, always 64 chars
+    role        ENUM('admin','cashier') NOT NULL DEFAULT 'cashier',
+    is_active   TINYINT(1)              NOT NULL DEFAULT 1,
+    parent_id   INT                     DEFAULT NULL,       -- NULL = top-level admin; cashiers point to their admin
+    created_at  TIMESTAMP               NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_parent
+        FOREIGN KEY (parent_id) REFERENCES users(id)
+        ON DELETE SET NULL
+);
+
+-- =============================================
+--  TABLE: time_log
+--  Records every Login / Logout event.
+--  module column is NOT NULL — always pass 'Inventory' or 'POS'.
+-- =============================================
+CREATE TABLE IF NOT EXISTS time_log (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    user_id     INT         NOT NULL,
+    username    VARCHAR(50) NOT NULL,
+    action      VARCHAR(50) NOT NULL,   -- 'Login' | 'Logout'
+    module      VARCHAR(50) NOT NULL,   -- 'Inventory' | 'POS'
+    log_time    DATETIME    NOT NULL,
+    CONSTRAINT fk_timelog_user
+        FOREIGN KEY (user_id) REFERENCES users(id)
+        ON DELETE CASCADE
+        ON UPDATE CASCADE
+);
+
+-- =============================================
+--  TABLE: products
+--  IMPORTANT: NO status column here.
+--  Status is derived at runtime from stock + low_stock_alert.
+-- =============================================
+CREATE TABLE IF NOT EXISTS products (
+    prod_id              INT AUTO_INCREMENT PRIMARY KEY,
+    user_id              INT            NOT NULL,           -- always the admin's id
+    name                 VARCHAR(100)   NOT NULL,
+    category             VARCHAR(100),
+    stock                INT            NOT NULL DEFAULT 0,
+    price                DECIMAL(10,2)  NOT NULL DEFAULT 0.00,
+    availability         ENUM('Available','Unavailable') NOT NULL DEFAULT 'Available',
+    low_stock_alert      INT            NOT NULL DEFAULT 5,
+    expiration_date      DATE,                             -- current batch expiry
+    next_expiration_date DATE,                             -- incoming batch expiry (set by StockAction)
+    batch_stock          INT            DEFAULT 0,         -- qty of current batch
+    next_batch_stock     INT            DEFAULT 0,         -- qty of incoming batch
+    created_at           TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_product_user
+        FOREIGN KEY (user_id) REFERENCES users(id)
+        ON DELETE CASCADE
+);
+
+-- =============================================
+--  TABLE: activity_log
+--  Written by: AddFoodSystem, EditFoodSystem,
+--              StockAction, DashboardInventory (Delete),
+--              DashboardPOS (sales → 'Stock Out').
+--  Read by:    DashboardInventory.loadRecentActivity().
+-- =============================================
+CREATE TABLE IF NOT EXISTS activity_log (
+    id           INT AUTO_INCREMENT PRIMARY KEY,
+    user_id      INT          NOT NULL,                    -- cashier OR admin who performed the action
+    product_name VARCHAR(100) NOT NULL,
+    quantity     INT          NOT NULL DEFAULT 0,
+    action_type  VARCHAR(50)  NOT NULL,                    -- see design rules at top of file
+    reason       TEXT,
+    log_time     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_actlog_user
+        FOREIGN KEY (user_id) REFERENCES users(id)
+        ON DELETE CASCADE
+);
+
+-- =============================================
+--  TABLE: deleted_categories
+--  Blacklists categories so they no longer appear
+--  in AddFoodSystem / EditFoodSystem dropdowns.
+--  Existing products in those categories are unaffected.
+-- =============================================
+CREATE TABLE IF NOT EXISTS deleted_categories (
+    id            INT AUTO_INCREMENT PRIMARY KEY,
+    user_id       INT          NOT NULL,
+    category_name VARCHAR(100) NOT NULL,
+    deleted_at    TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_user_cat (user_id, category_name),
+    CONSTRAINT fk_delcat_user
+        FOREIGN KEY (user_id) REFERENCES users(id)
+        ON DELETE CASCADE
+);
+
+-- =============================================
+--  TABLE: transactions
+--  Written by DashboardPOS.processTransaction().
+--  Read by    DashboardInventory.loadTodaySales()
+--             and DashboardPOS.loadTodaySalesReport().
+--
+--  Columns added vs original schema:
+--    payment_method  — 'Cash' | 'GCash' | 'Credit Card'
+--    cash_tendered   — amount the customer handed over
+--    change_given    — cash_tendered - total_amount (0 for GCash/Credit)
+-- =============================================
+CREATE TABLE IF NOT EXISTS transactions (
+    id               INT AUTO_INCREMENT PRIMARY KEY,
+    user_id          INT            NOT NULL,              -- cashier or admin who made the sale
+    total_amount     DECIMAL(10,2)  NOT NULL,              -- grand total including 12% tax
+    payment_method   VARCHAR(20)    NOT NULL DEFAULT 'Cash',
+    cash_tendered    DECIMAL(10,2)  NOT NULL DEFAULT 0.00,
+    change_given     DECIMAL(10,2)  NOT NULL DEFAULT 0.00,
+    transaction_date DATETIME       NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_trans_user
+        FOREIGN KEY (user_id) REFERENCES users(id)
+        ON DELETE CASCADE
+);
+
+-- =============================================
+--  MIGRATION ONLY
+--  If your database already exists and you just
+--  need to add the new columns, run these lines
+--  instead of the CREATE TABLE above.
+--  Skip this block on a fresh install.
+-- =============================================
+-- ALTER TABLE transactions
+--     ADD COLUMN IF NOT EXISTS payment_method VARCHAR(20)   NOT NULL DEFAULT 'Cash' AFTER total_amount,
+--     ADD COLUMN IF NOT EXISTS cash_tendered  DECIMAL(10,2) NOT NULL DEFAULT 0.00   AFTER payment_method,
+--     ADD COLUMN IF NOT EXISTS change_given   DECIMAL(10,2) NOT NULL DEFAULT 0.00   AFTER cash_tendered;
+
+CREATE TABLE transaction_items (
+    id              INT AUTO_INCREMENT PRIMARY KEY,
+    transaction_id  INT NOT NULL,
+    product_id      INT NOT NULL,
+    product_name    VARCHAR(255) NOT NULL,
+    quantity        INT NOT NULL,
+    unit_price      DECIMAL(10,2) NOT NULL,
+    subtotal        DECIMAL(10,2) NOT NULL,
+    FOREIGN KEY (transaction_id) REFERENCES transactions(id)
+);
